@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+line-bot-sdk>=3
+google-genai
+supabase
+python-dotenv
+google-auth
+requests
