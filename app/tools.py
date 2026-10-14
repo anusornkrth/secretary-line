@@ -1,5 +1,5 @@
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from google import genai
 from google.genai import types
@@ -56,13 +56,18 @@ _TOOL_DEFS = [
         "name": "list_meetings",
         "description": (
             "ดูรายการประชุมจาก Google Calendar ของอีเมลที่ระบุ "
-            "ใช้เมื่อผู้ใช้ส่งอีเมลมา หรือถามว่าใครมีประชุมอะไร ผลลัพธ์จัดรูปแบบพร้อมส่งให้ผู้ใช้แล้ว"
+            "ใช้เมื่อผู้ใช้ส่งอีเมลมา หรือถามว่าใครมีประชุมอะไร ดูได้ทั้งวันเดียวหรือเป็นช่วง (สูงสุด 62 วัน) "
+            "ผลลัพธ์จัดรูปแบบพร้อมส่งให้ผู้ใช้แล้ว"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "email": {"type": "string", "description": "อีเมลเจ้าของปฏิทิน"},
-                "date": {"type": "string", "description": "วันที่ YYYY-MM-DD (ไม่ระบุ = วันนี้)"},
+                "date": {"type": "string", "description": "วันที่ YYYY-MM-DD หรือวันแรกของช่วง (ไม่ระบุ = วันนี้)"},
+                "end_date": {
+                    "type": "string",
+                    "description": "วันสุดท้ายของช่วง YYYY-MM-DD ใช้เมื่อถามหลายวัน เช่น ทั้งสัปดาห์ ทั้งเดือน (ไม่ระบุ = วันเดียว)",
+                },
             },
             "required": ["email"],
         },
@@ -104,20 +109,61 @@ def summarize_today(chat_id: str) -> str:
     return (resp.text or "").strip() or "ขออภัย สรุปแชทไม่สำเร็จ ลองใหม่อีกครั้งนะคะ"
 
 
-def meetings_text(email: str, day_str: str | None = None) -> str:
+THAI_DAYS = ["จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา."]
+THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+               "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
+MAX_RANGE_DAYS = 62
+
+
+def _thai_date(d: date) -> str:
+    return f"{THAI_DAYS[d.weekday()]} {d.day} {THAI_MONTHS[d.month - 1]}"
+
+
+def month_range(today: date | None = None) -> tuple[str, str]:
+    """วันแรกและวันสุดท้ายของเดือนปัจจุบัน (YYYY-MM-DD)"""
+    today = today or datetime.now(ZoneInfo(TIMEZONE)).date()
+    first = today.replace(day=1)
+    last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    return first.isoformat(), last.isoformat()
+
+
+def _meeting_line(m: dict) -> str:
+    title = m["title"] if m["title"].startswith("ประชุม") else f"ประชุม {m['title']}"
+    return f"{m['time']} {title}"
+
+
+def meetings_text(email: str, day_str: str | None = None, end_str: str | None = None) -> str:
     today = datetime.now(ZoneInfo(TIMEZONE)).date()
-    day = date.fromisoformat(day_str) if day_str else today
-    label = "วันนี้" if day == today else f"วันที่ {day.isoformat()} "
+    first = date.fromisoformat(day_str) if day_str else today
+    last = date.fromisoformat(end_str) if end_str else first
+    if last < first:
+        first, last = last, first
+    if (last - first).days >= MAX_RANGE_DAYS:
+        return f"ขอดูได้ครั้งละไม่เกิน {MAX_RANGE_DAYS} วันนะคะ"
     try:
-        meetings = calendar_client.list_meetings(email, day)
+        meetings = calendar_client.list_meetings(email, first, last)
     except calendar_client.CalendarError as e:
         return str(e)
+
+    # วันเดียว: รูปแบบเดิม
+    if first == last:
+        label = "วันนี้" if first == today else f"วันที่ {first.isoformat()} "
+        if not meetings:
+            return f"คุณ {email}\n{label}ไม่มีประชุม"
+        lines = [f"คุณ {email}", "มีประชุมดังนี้" if first == today else f"มีประชุม{label}ดังนี้"]
+        return "\n".join(lines + [_meeting_line(m) for m in meetings])
+
+    # หลายวัน: จัดกลุ่มตามวัน แสดงเฉพาะวันที่มีประชุม
+    span = f"{_thai_date(first)} – {_thai_date(last)} {last.year}"
     if not meetings:
-        return f"คุณ {email}\n{label}ไม่มีประชุม"
-    lines = [f"คุณ {email}", "มีประชุมดังนี้" if day == today else f"มีประชุม{label}ดังนี้"]
+        return f"คุณ {email}\nช่วง {span} ไม่มีประชุม"
+    lines = [f"คุณ {email}", f"ตารางประชุม {span} ({len(meetings)} รายการ)"]
+    current = None
     for m in meetings:
-        title = m["title"] if m["title"].startswith("ประชุม") else f"ประชุม {m['title']}"
-        lines.append(f"{m['time']} {title}")
+        if m["date"] != current:
+            current = m["date"]
+            lines.append(f"\n📅 {_thai_date(current)}" + (" (วันนี้)" if current == today else ""))
+        lines.append(_meeting_line(m))
     return "\n".join(lines)
 
 
@@ -133,7 +179,7 @@ def execute_tool(name: str, args: dict, chat_id: str) -> str:
         if name == "summarize_chat":
             return summarize_today(chat_id)
         if name == "list_meetings":
-            return meetings_text(args["email"].strip(), args.get("date"))
+            return meetings_text(args["email"].strip(), args.get("date"), args.get("end_date"))
         if name == "subscribe_daily_summary":
             db.subscribe(chat_id)
             return "สมัครสรุปรายวันเรียบร้อย"

@@ -7,12 +7,13 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent, JoinEvent
 
 from . import db, line_client
 from .agent import run_agent
-from .tools import meetings_text, summarize_today
+from .tools import meetings_text, month_range, summarize_today
 from .config import LINE_CHANNEL_SECRET, CRON_SECRET, BOT_TRIGGER
 
 app = FastAPI()
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 EMAIL_ONLY = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+EMAIL_MONTH = re.compile(r"([\w.+-]+@[\w-]+(?:\.[\w-]+)+)\s*(?:เดือนนี้|ทั้งเดือน)")
 
 
 @app.get("/")
@@ -70,6 +71,9 @@ def handle_event(event):
         if EMAIL_ONLY.fullmatch(text):
             # ส่งมาแค่อีเมล → ตอบรายการประชุมวันนี้ตรง ๆ ไม่ต้องผ่าน AI (เร็วกว่าและไม่กินโควตา)
             answer = meetings_text(text)
+        elif m := EMAIL_MONTH.fullmatch(text):
+            # "<อีเมล> เดือนนี้" → ตารางทั้งเดือน ไม่ต้องผ่าน AI เช่นกัน
+            answer = meetings_text(m.group(1), *month_range())
         else:
             answer = run_agent(chat_id, text)
     except Exception as e:

@@ -35,37 +35,47 @@ def _get_session() -> AuthorizedSession:
     return _session
 
 
-def list_meetings(email: str, day: date) -> list[dict]:
-    """คืนรายการนัดของปฏิทิน email ในวันที่ day เรียงตามเวลา: [{"time": "9.00", "title": ...}]"""
+def list_meetings(email: str, first: date, last: date | None = None) -> list[dict]:
+    """คืนรายการนัดของปฏิทิน email ตั้งแต่วัน first ถึง last (รวมวันสุดท้าย) เรียงตามเวลา
+    [{"date": date, "time": "9.00", "title": ...}]"""
     session = _get_session()
-    start = datetime.combine(day, time.min, tzinfo=TZ)
-    resp = session.get(
-        f"https://www.googleapis.com/calendar/v3/calendars/{quote(email, safe='')}/events",
-        params={
-            "timeMin": start.isoformat(),
-            "timeMax": (start + timedelta(days=1)).isoformat(),
-            "singleEvents": "true",   # แตกนัดที่เกิดซ้ำออกเป็นรายครั้ง
-            "orderBy": "startTime",
-            "timeZone": TIMEZONE,
-            "maxResults": 50,
-        },
-        timeout=15,
-    )
-    if resp.status_code in (403, 404):
-        raise CalendarError(
-            f"เลขายังเข้าปฏิทินของ {email} ไม่ได้ "
-            f"เจ้าของปฏิทินต้องแชร์ปฏิทินให้ {_sa_email} ก่อน")
-    resp.raise_for_status()
+    start = datetime.combine(first, time.min, tzinfo=TZ)
+    end = datetime.combine(last or first, time.min, tzinfo=TZ) + timedelta(days=1)
+    params = {
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
+        "singleEvents": "true",   # แตกนัดที่เกิดซ้ำออกเป็นรายครั้ง
+        "orderBy": "startTime",
+        "timeZone": TIMEZONE,
+        "maxResults": 250,
+    }
+    items = []
+    while True:  # ทั้งเดือนอาจเกิน 1 หน้า
+        resp = session.get(
+            f"https://www.googleapis.com/calendar/v3/calendars/{quote(email, safe='')}/events",
+            params=params, timeout=15,
+        )
+        if resp.status_code in (403, 404):
+            raise CalendarError(
+                f"เลขายังเข้าปฏิทินของ {email} ไม่ได้ "
+                f"เจ้าของปฏิทินต้องแชร์ปฏิทินให้ {_sa_email} ก่อน")
+        resp.raise_for_status()
+        data = resp.json()
+        items += data.get("items", [])
+        if not data.get("nextPageToken"):
+            break
+        params["pageToken"] = data["nextPageToken"]
 
     meetings = []
-    for ev in resp.json().get("items", []):
+    for ev in items:
         if ev.get("status") == "cancelled":
             continue
         start_at = ev["start"].get("dateTime")
         if start_at:
             t = datetime.fromisoformat(start_at).astimezone(TZ)
-            when = f"{t.hour}.{t.minute:02d}"
+            day, when = t.date(), f"{t.hour}.{t.minute:02d}"
         else:
-            when = "ทั้งวัน"
-        meetings.append({"time": when, "title": ev.get("summary") or "(ไม่มีชื่อ)"})
+            # กิจกรรมทั้งวันที่เริ่มก่อนช่วงที่ถาม ให้แสดงที่วันแรกของช่วงแทน
+            day, when = max(date.fromisoformat(ev["start"]["date"]), first), "ทั้งวัน"
+        meetings.append({"date": day, "time": when, "title": ev.get("summary") or "(ไม่มีชื่อ)"})
     return meetings
